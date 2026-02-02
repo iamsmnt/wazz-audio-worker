@@ -1,0 +1,14 @@
+# Note: shared-lib is installed separately in the Dockerfile
+
+# Task queue
+celery==5.3.4
+flower>=2.0.0
+
+# Pydantic email validation (required by shared-lib schemas)
+email-validator>=2.0.0
+
+# Audio processing
+clearvoice==0.1.2
+
+# Note: Database, storage, and core dependencies are provided by shared-lib
+# This keeps the worker-service lean and focused on processing tasks
