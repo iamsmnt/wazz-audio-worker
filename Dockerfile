@@ -16,16 +16,16 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy shared library first
-COPY shared-lib /app/shared-lib
+COPY wazz-audio-shared /app/wazz-audio-shared
 
 # Install shared library
-RUN pip install --no-cache-dir -e /app/shared-lib
+RUN pip install --no-cache-dir /app/wazz-audio-shared
 
 # Copy worker-service files
-COPY worker-service/requirements.txt .
-COPY worker-service/celery_app.py .
-COPY worker-service/tasks.py .
-COPY worker-service/celery_config.py .
+COPY wazz-audio-worker/requirements.txt .
+COPY wazz-audio-worker/celery_app.py .
+COPY wazz-audio-worker/tasks.py .
+COPY wazz-audio-worker/celery_config.py .
 
 # Install worker dependencies
 RUN pip install --no-cache-dir -r requirements.txt
