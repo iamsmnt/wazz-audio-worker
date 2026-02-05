@@ -64,9 +64,10 @@ def process_audio_task(self, job_id: str):
             raise FileNotFoundError(f"Input file not found: {job.input_file_path}")
 
         # Step 4: Setup output directory and path
-        os.makedirs(settings.output_dir, exist_ok=True)
+        output_dir = os.path.abspath(settings.output_dir)
+        os.makedirs(output_dir, exist_ok=True)
         output_filename = f"processed_{job.filename}"
-        final_output_path = os.path.join(settings.output_dir, output_filename)
+        final_output_path = os.path.join(output_dir, output_filename)
 
         job.progress = 10.0
         db.commit()
@@ -86,12 +87,12 @@ def process_audio_task(self, job_id: str):
         db.commit()
 
         # Get list of files before processing to detect new files
-        files_before = set(os.listdir(settings.output_dir)) if os.path.exists(settings.output_dir) else set()
+        files_before = set(os.listdir(output_dir)) if os.path.exists(output_dir) else set()
 
         cv(
             input_path=job.input_file_path,
             online_write=True,
-            output_path=settings.output_dir
+            output_path=output_dir
         )
 
         job.progress = 90.0
@@ -99,7 +100,7 @@ def process_audio_task(self, job_id: str):
 
         # Step 7: Handle output file naming
         # ClearVoice/MossFormer2 creates files in a model subdirectory
-        model_output_dir = os.path.join(settings.output_dir, settings.clearvoice_model_name)
+        model_output_dir = os.path.join(output_dir, settings.clearvoice_model_name)
 
         if os.path.exists(model_output_dir) and os.path.isdir(model_output_dir):
             # Look for audio files in the model subdirectory
@@ -118,17 +119,17 @@ def process_audio_task(self, job_id: str):
 
         else:
             # Fallback: look in root output directory
-            files_after = set(os.listdir(settings.output_dir))
+            files_after = set(os.listdir(output_dir))
             new_files = files_after - files_before
 
             if not new_files:
                 raise FileNotFoundError(
-                    f"No new output file created in {settings.output_dir}. "
+                    f"No new output file created in {output_dir}. "
                     f"Files in directory: {list(files_after)}"
                 )
 
             output_file = new_files.pop()
-            actual_output_path = os.path.join(settings.output_dir, output_file)
+            actual_output_path = os.path.join(output_dir, output_file)
 
         # Move the file to our desired output path
         import shutil
