@@ -7,17 +7,40 @@ from wazz_shared.models import AudioProcessingJob
 from wazz_shared.usage_tracking import track_processing_complete
 from clearvoice import ClearVoice
 import os
+import shutil
+import zipfile
 import traceback
 from datetime import datetime, timezone
 from wazz_shared.config import get_shared_settings
 
 settings = get_shared_settings()
 
+# Maps frontend processing_type to ClearVoice task and model
+TASK_CONFIG = {
+    "speech_enhancement": {
+        "cv_task": "speech_enhancement",
+        "model": settings.clearvoice_model_name,
+        "multi_output": False,
+    },
+    "noise_reduction": {
+        "cv_task": "speech_enhancement",
+        "model": settings.clearvoice_model_name,
+        "multi_output": False,
+    },
+    "speaker_separation": {
+        "cv_task": "speech_separation",
+        "model": settings.clearvoice_separation_model_name,
+        "multi_output": True,
+    },
+}
+
+AUDIO_EXTENSIONS = ('.wav', '.mp3', '.flac', '.m4a', '.ogg')
+
 
 class DatabaseTask(Task):
     """Base task with database session and model management"""
     _db = None
-    _cv_model = None
+    _cv_models = {}
 
     @property
     def db(self):
@@ -25,15 +48,19 @@ class DatabaseTask(Task):
             self._db = SessionLocal()
         return self._db
 
-    @property
-    def cv_model(self):
-        """ClearVoice model cached per worker process — loaded once, reused across tasks."""
-        if self._cv_model is None:
-            self._cv_model = ClearVoice(
-                task='speech_enhancement',
-                model_names=[settings.clearvoice_model_name]
+    def get_cv_model(self, processing_type: str) -> ClearVoice:
+        """Get or create a cached ClearVoice model for the given processing type."""
+        config = TASK_CONFIG.get(processing_type)
+        if not config:
+            raise ValueError(f"Unsupported processing type: {processing_type}")
+
+        cache_key = f"{config['cv_task']}_{config['model']}"
+        if cache_key not in self._cv_models:
+            self._cv_models[cache_key] = ClearVoice(
+                task=config["cv_task"],
+                model_names=[config["model"]],
             )
-        return self._cv_model
+        return self._cv_models[cache_key]
 
     def after_return(self, *args, **kwargs):
         if self._db is not None:
@@ -44,17 +71,13 @@ class DatabaseTask(Task):
 @celery_app.task(base=DatabaseTask, bind=True, name='tasks.process_audio_task')
 def process_audio_task(self, job_id: str):
     """
-    Process audio file with ClearVoice noise reduction
+    Process audio file with ClearVoice.
 
-    Args:
-        job_id: UUID of the AudioProcessingJob
-
-    Returns:
-        dict: Processing result with job_id, status, and output_path
+    Supports: speech_enhancement, noise_reduction, speaker_separation.
+    Routes to the correct ClearVoice task/model based on job.processing_type.
     """
     db = self.db
 
-    # Step 1: Fetch job from database
     job = db.query(AudioProcessingJob).filter(
         AudioProcessingJob.job_id == job_id
     ).first()
@@ -63,40 +86,35 @@ def process_audio_task(self, job_id: str):
         raise ValueError(f"Job {job_id} not found")
 
     try:
-        # Step 2: Update status to processing
+        processing_type = job.processing_type or "speech_enhancement"
+        config = TASK_CONFIG.get(processing_type)
+
+        if not config:
+            raise ValueError(f"Unsupported processing type: {processing_type}")
+
         job.status = "processing"
         job.started_at = datetime.now(timezone.utc)
         job.progress = 5.0
-        job.processing_type = "speech_enhancement"
         db.commit()
 
-        # Step 3: Validate input file exists
         if not os.path.exists(job.input_file_path):
             raise FileNotFoundError(f"Input file not found: {job.input_file_path}")
 
-        # Step 4: Setup output directory and path
         output_dir = os.path.abspath(settings.output_dir)
         os.makedirs(output_dir, exist_ok=True)
-        output_filename = f"processed_{job.filename}"
-        final_output_path = os.path.join(output_dir, output_filename)
 
         job.progress = 10.0
         db.commit()
 
-        # Step 5: Get cached ClearVoice model (loaded once per worker)
-        cv = self.cv_model
+        cv = self.get_cv_model(processing_type)
 
         job.progress = 20.0
         db.commit()
 
-        # Step 6: Process audio
-        # Note: ClearVoice doesn't support progress callbacks, so we update at key points
         job.progress = 50.0
         db.commit()
 
-        # Get list of files before processing to detect new files
-        files_before = set(os.listdir(output_dir)) if os.path.exists(output_dir) else set()
-
+        # Run ClearVoice processing
         cv(
             input_path=job.input_file_path,
             online_write=True,
@@ -106,56 +124,35 @@ def process_audio_task(self, job_id: str):
         job.progress = 90.0
         db.commit()
 
-        # Step 7: Handle output file naming
-        # ClearVoice/MossFormer2 creates files in a model subdirectory
-        model_output_dir = os.path.join(output_dir, settings.clearvoice_model_name)
+        # Collect output files from model subdirectory
+        model_output_dir = os.path.join(output_dir, config["model"])
+        output_files = _find_output_files(model_output_dir, output_dir)
 
-        if os.path.exists(model_output_dir) and os.path.isdir(model_output_dir):
-            # Look for audio files in the model subdirectory
-            output_files = [f for f in os.listdir(model_output_dir)
-                          if f.endswith(('.wav', '.mp3', '.flac', '.m4a', '.ogg'))]
+        if not output_files:
+            raise FileNotFoundError(
+                f"No output files produced by {config['model']}"
+            )
 
-            if not output_files:
-                raise FileNotFoundError(
-                    f"No audio files found in {model_output_dir}. "
-                    f"Files present: {os.listdir(model_output_dir)}"
-                )
-
-            # Get the most recently modified file (should be the one we just created)
-            output_files.sort(key=lambda f: os.path.getmtime(os.path.join(model_output_dir, f)), reverse=True)
-            actual_output_path = os.path.join(model_output_dir, output_files[0])
-
+        if config["multi_output"] and len(output_files) > 1:
+            final_output_path = _zip_outputs(
+                output_files, output_dir, job.filename
+            )
         else:
-            # Fallback: look in root output directory
-            files_after = set(os.listdir(output_dir))
-            new_files = files_after - files_before
+            final_output_path = os.path.join(
+                output_dir, f"processed_{job.filename}"
+            )
+            shutil.move(output_files[0], final_output_path)
 
-            if not new_files:
-                raise FileNotFoundError(
-                    f"No new output file created in {output_dir}. "
-                    f"Files in directory: {list(files_after)}"
-                )
-
-            output_file = new_files.pop()
-            actual_output_path = os.path.join(output_dir, output_file)
-
-        # Move the file to our desired output path
-        import shutil
-        shutil.move(actual_output_path, final_output_path)
-
-        # Step 8: Update job as completed
         job.status = "completed"
         job.completed_at = datetime.now(timezone.utc)
         job.progress = 100.0
         job.output_file_path = final_output_path
 
-        # Calculate processing time and output file size
         processing_time = (job.completed_at - job.started_at).total_seconds() if job.started_at else 0.0
         output_file_size = float(os.path.getsize(final_output_path)) if os.path.exists(final_output_path) else 0.0
 
         db.commit()
 
-        # Track successful processing for usage statistics
         track_processing_complete(
             db=db,
             user_id=job.user_id,
@@ -172,18 +169,15 @@ def process_audio_task(self, job_id: str):
         }
 
     except Exception as e:
-        # Step 9: Handle errors
         error_msg = f"{str(e)}\n{traceback.format_exc()}"
         job.status = "failed"
         job.error_message = error_msg
         job.completed_at = datetime.now(timezone.utc)
 
-        # Calculate processing time even for failed jobs
         processing_time = (job.completed_at - job.started_at).total_seconds() if job.started_at else 0.0
 
         db.commit()
 
-        # Track failed processing for usage statistics
         track_processing_complete(
             db=db,
             user_id=job.user_id,
@@ -193,8 +187,46 @@ def process_audio_task(self, job_id: str):
             success=False
         )
 
-        # Re-raise to mark task as failed in Celery
         raise
+
+
+def _find_output_files(model_output_dir: str, output_dir: str) -> list[str]:
+    """Find audio output files, checking model subdirectory first, then root."""
+    if os.path.exists(model_output_dir) and os.path.isdir(model_output_dir):
+        files = [
+            os.path.join(model_output_dir, f)
+            for f in os.listdir(model_output_dir)
+            if f.endswith(AUDIO_EXTENSIONS)
+        ]
+        files.sort(key=os.path.getmtime, reverse=True)
+        return files
+
+    # Fallback: root output directory
+    files = [
+        os.path.join(output_dir, f)
+        for f in os.listdir(output_dir)
+        if f.endswith(AUDIO_EXTENSIONS)
+    ]
+    files.sort(key=os.path.getmtime, reverse=True)
+    return files
+
+
+def _zip_outputs(file_paths: list[str], output_dir: str, job_filename: str) -> str:
+    """Zip multiple output files into a single archive."""
+    base_name = os.path.splitext(job_filename)[0]
+    zip_path = os.path.join(output_dir, f"separated_{base_name}.zip")
+
+    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for i, fp in enumerate(file_paths, 1):
+            ext = os.path.splitext(fp)[1]
+            arcname = f"speaker_{i}{ext}"
+            zf.write(fp, arcname)
+
+    # Clean up individual files
+    for fp in file_paths:
+        os.remove(fp)
+
+    return zip_path
 
 
 @celery_app.task(name='tasks.cleanup_expired_files')
