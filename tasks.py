@@ -15,14 +15,25 @@ settings = get_shared_settings()
 
 
 class DatabaseTask(Task):
-    """Base task with database session management"""
+    """Base task with database session and model management"""
     _db = None
+    _cv_model = None
 
     @property
     def db(self):
         if self._db is None:
             self._db = SessionLocal()
         return self._db
+
+    @property
+    def cv_model(self):
+        """ClearVoice model cached per worker process — loaded once, reused across tasks."""
+        if self._cv_model is None:
+            self._cv_model = ClearVoice(
+                task='speech_enhancement',
+                model_names=[settings.clearvoice_model_name]
+            )
+        return self._cv_model
 
     def after_return(self, *args, **kwargs):
         if self._db is not None:
@@ -72,11 +83,8 @@ def process_audio_task(self, job_id: str):
         job.progress = 10.0
         db.commit()
 
-        # Step 5: Initialize ClearVoice model
-        cv = ClearVoice(
-            task='speech_enhancement',
-            model_names=[settings.clearvoice_model_name]
-        )
+        # Step 5: Get cached ClearVoice model (loaded once per worker)
+        cv = self.cv_model
 
         job.progress = 20.0
         db.commit()

@@ -39,4 +39,4 @@ ENV CELERY_BROKER_URL=amqp://guest:guest@rabbitmq:5672//
 ENV DATABASE_URL=postgresql://postgres:postgres@postgres:5432/whazz_audio
 
 # Run Celery worker
-CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "-Q", "audio_processing,maintenance"]
+CMD ["celery", "-A", "celery_app", "worker", "--loglevel=info", "--concurrency=1", "-Q", "audio_processing,maintenance"]
